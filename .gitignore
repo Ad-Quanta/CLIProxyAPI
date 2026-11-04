@@ -67,3 +67,16 @@ docker-compose.override.yml
 
 # Local LLM Wiki vault
 .llm-wiki
+
+# Local deployment state and ops files
+home/
+scripts/
+__pycache__/
+*.pyc
+
+# Local credential exports (OAuth tokens)
+/kimi-*.json
+
+# Internal ops notes (host IPs / topology)
+/OPS.md
+/HANDOFF_*.md
