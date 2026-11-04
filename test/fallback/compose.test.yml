@@ -1,0 +1,20 @@
+# Standalone compose file for the model fallback integration test.
+# Always run with an explicit -f so the production docker-compose.override.yml
+# (Home mode) is never merged in.
+
+name: cpa-fallback-test
+
+services:
+  cli-proxy-api-fallback-test:
+    image: cliproxy-api:fallback-test
+    pull_policy: never
+    container_name: cli-proxy-api-fallback-test
+    ports:
+      - "127.0.0.1:18317:8317"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./config.test.yaml:/CLIProxyAPI/config.yaml:ro
+      - ./auths:/root/.cli-proxy-api
+      - ./logs:/CLIProxyAPI/logs
+    restart: "no"

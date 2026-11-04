@@ -1,0 +1,4 @@
+auths/
+logs/
+mock.log
+__pycache__/

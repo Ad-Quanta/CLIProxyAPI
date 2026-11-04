@@ -1,0 +1,34 @@
+# Isolated config for the model fallback integration test.
+# It never enables Home mode and never references production credentials.
+
+host: "0.0.0.0"
+port: 8317
+
+api-keys:
+  - "fallback-test-key"
+
+model-fallback:
+  enabled: true
+  preserve-requested-model: true
+  trigger-status-codes: [429, 500, 502, 503, 504]
+  no-fallback-status-codes: [400, 401, 403, 422]
+  rules:
+    - from: "fallback-primary"
+      to:
+        - "fallback-target"
+
+openai-compatibility:
+  - name: "mock"
+    base-url: "http://host.docker.internal:18318/v1"
+    # Keep each test case independent: a 429 must not cool the credential and
+    # hide the fallback path behind an auth-selection failure.
+    disable-cooling: true
+    api-key-entries:
+      - api-key: "mock-key"
+    models:
+      - name: "fallback-primary"
+        alias: "fallback-primary"
+      - name: "fallback-target"
+        alias: "fallback-target"
+      - name: "no-fallback-primary"
+        alias: "no-fallback-primary"
