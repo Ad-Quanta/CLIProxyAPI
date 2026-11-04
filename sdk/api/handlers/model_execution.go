@@ -29,6 +29,12 @@ type modelExecutionOptions struct {
 	Path                    string
 	CallerScope             string
 	AllowSpeechModel        bool
+	// ClientModel records the model name the client asked for. It survives
+	// cross-model fallback so responses can be rewritten back to it.
+	ClientModel string
+	// FallbackDepth is the number of cross-model fallback hops already taken
+	// for this request.
+	FallbackDepth int
 }
 
 // ProtocolExecutionRequest describes a route-level model execution request with explicit protocols.
