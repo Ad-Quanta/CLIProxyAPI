@@ -9,6 +9,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
@@ -281,119 +282,139 @@ func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handl
 	return h.executeStreamWithAuthManagerFormats(ctx, handlerType, handlerType, modelName, rawJSON, alt, allowImageModel, modelExecutionOptions{})
 }
 
+// streamAttempt holds one resolved upstream attempt for a streaming request.
+// Cross-model fallback replaces it before any response byte is delivered.
+type streamAttempt struct {
+	providers       []string
+	normalizedModel string
+	req             coreexecutor.Request
+	opts            coreexecutor.Options
+	capture         *requestAfterAuthCapture
+	ctx             context.Context
+}
+
+func streamErrorChannels(errMsg *interfaces.ErrorMessage) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
+	errChan := make(chan *interfaces.ErrorMessage, 1)
+	errChan <- errMsg
+	close(errChan)
+	return nil, nil, errChan
+}
+
 func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context, entryProtocol, exitProtocol, modelName string, rawJSON []byte, alt string, allowImageModel bool, execOptions modelExecutionOptions) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
 	originalRequestedModel := modelName
 	// Speech-only models are reachable solely through the speech entry protocol.
 	execOptions.AllowSpeechModel = isModelExecutionSpeechProtocol(entryProtocol)
-	routeDecision, preparedRoute := preparedModelRouteFromContext(ctx, execOptions.SkipRouterPluginID)
+	initialRouteDecision, preparedRoute := preparedModelRouteFromContext(ctx, execOptions.SkipRouterPluginID)
 	if !preparedRoute {
-		routeDecision = h.applyModelRouter(ctx, entryProtocol, modelName, rawJSON, true, execOptions)
+		initialRouteDecision = h.applyModelRouter(ctx, entryProtocol, modelName, rawJSON, true, execOptions)
 	}
 	responseProtocol := modelExecutionResponseProtocol(entryProtocol, exitProtocol)
-	if errMsg := validateNativeInteractionsExecution(entryProtocol, execOptions, routeDecision); errMsg != nil {
-		errChan := make(chan *interfaces.ErrorMessage, 1)
-		errChan <- errMsg
-		close(errChan)
-		return nil, nil, errChan
+	if errMsg := validateNativeInteractionsExecution(entryProtocol, execOptions, initialRouteDecision); errMsg != nil {
+		return streamErrorChannels(errMsg)
 	}
-	if routeDecision.ExecutorPluginID != "" {
-		return h.streamWithPluginExecutor(ctx, entryProtocol, responseProtocol, modelName, originalRequestedModel, rawJSON, alt, routeDecision.ExecutorPluginID, execOptions)
+	if initialRouteDecision.ExecutorPluginID != "" {
+		return h.streamWithPluginExecutor(ctx, entryProtocol, responseProtocol, modelName, originalRequestedModel, rawJSON, alt, initialRouteDecision.ExecutorPluginID, execOptions)
 	}
-	providers, normalizedModel, errMsg := h.providersForExecution(modelName, originalRequestedModel, allowImageModel, routeDecision, execOptions)
-	if errMsg != nil {
-		errChan := make(chan *interfaces.ErrorMessage, 1)
-		errChan <- errMsg
-		close(errChan)
-		return nil, nil, errChan
-	}
-	providers = adjustExecutionProvidersForEntryProtocol(entryProtocol, providers)
-	reqMeta := requestExecutionMetadata(ctx)
-	if execOptions.Path != "" {
-		reqMeta[coreexecutor.RequestPathMetadataKey] = execOptions.Path
-	}
-	addCallerScopeMetadata(reqMeta, execOptions.CallerScope)
-	reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
-	addAuthSelectionModelMetadata(reqMeta, execOptions.AuthSelectionModel)
-	addModelExecutionSourceMetadata(reqMeta, execOptions.InternalSource)
-	setReasoningEffortMetadata(reqMeta, entryProtocol, normalizedModel, rawJSON)
-	setServiceTierMetadata(reqMeta, rawJSON)
-	setGenerateMetadata(reqMeta, rawJSON)
-	payload := rawJSON
-	if len(payload) == 0 {
-		payload = nil
-	}
-	req := coreexecutor.Request{
-		Model:   normalizedModel,
-		Payload: payload,
-	}
-	originalRequest := rawJSON
-	if ctxOriginal := originalRequestFromContext(ctx); len(ctxOriginal) > 0 {
-		originalRequest = ctxOriginal
-	}
-	afterAuthCapture := &requestAfterAuthCapture{}
-	lifecycle := h.newRequestLifecycleTracker(ctx, entryProtocol, normalizedModel, originalRequestedModel, true, reqMeta, execOptions.SkipInterceptorPluginID)
-	opts := coreexecutor.Options{
-		Stream:                       true,
-		Alt:                          alt,
-		OriginalRequest:              originalRequest,
-		SourceFormat:                 sdktranslator.FromString(entryProtocol),
-		ResponseFormat:               sdktranslator.FromString(responseProtocol),
-		Headers:                      modelExecutionHeaders(ctx, execOptions.Headers),
-		Query:                        modelExecutionQuery(ctx, execOptions.Query),
-		RequestBeforeAuthInterceptor: h.requestBeforeAuthInterceptor(lifecycle.requestID(), execOptions.SkipInterceptorPluginID),
-		RequestAfterAuthInterceptor:  h.requestAfterAuthInterceptor(afterAuthCapture, lifecycle.requestID(), execOptions.SkipInterceptorPluginID),
-		WebSocketResponseObserver:    h.webSocketResponseObserver(lifecycle.requestID(), execOptions.SkipInterceptorPluginID),
-		ProxyURL:                     execOptions.ProxyURL,
-	}
-	opts.Metadata = reqMeta
-	ctx = enrichContextWithSessionHierarchy(ctx, opts.Headers, req.Payload, opts.Metadata)
-	var interceptErr *interfaces.ErrorMessage
-	req, opts, interceptErr = h.applyRequestInterceptorsBeforeAuth(ctx, entryProtocol, originalRequestedModel, lifecycle.requestID(), req, opts, execOptions.SkipInterceptorPluginID)
-	if interceptErr != nil {
-		lifecycle.completeError(ctx, interceptErr)
-		errChan := make(chan *interfaces.ErrorMessage, 1)
-		errChan <- interceptErr
-		close(errChan)
-		return nil, nil, errChan
-	}
-	ctx = enrichContextWithSessionHierarchy(ctx, opts.Headers, req.Payload, opts.Metadata)
-	streamResult, err := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
-	if err != nil {
-		err = enrichAuthSelectionError(err, providers, normalizedModel)
-		errMsg := executionErrorMessage(err)
-		lifecycle.completeError(ctx, errMsg)
-		errChan := make(chan *interfaces.ErrorMessage, 1)
-		errChan <- errMsg
-		close(errChan)
-		return nil, nil, errChan
-	}
-	if streamResult == nil {
-		errMsg := &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("auth manager returned nil stream")}
-		lifecycle.completeError(ctx, errMsg)
-		errChan := make(chan *interfaces.ErrorMessage, 1)
-		errChan <- errMsg
-		close(errChan)
-		return nil, nil, errChan
-	}
-	executedRequest := func() (coreexecutor.Request, coreexecutor.Options) {
-		return afterAuthCapture.apply(req, opts)
-	}
-	if executedReq, executedOpts := executedRequest(); len(executedOpts.Headers) > 0 || len(executedReq.Payload) > 0 || len(executedOpts.Metadata) > 0 {
-		ctx = enrichContextWithSessionHierarchy(ctx, executedOpts.Headers, executedReq.Payload, executedOpts.Metadata)
-	}
+
+	baseCtx := ctx
 	passthroughHeadersEnabled := executionPassthroughHeaders(h.CurrentConfig(), execOptions.InternalSource)
 	interceptorHost := h.interceptorHost()
 	streamInterceptorsActive := streamInterceptorsEnabled(interceptorHost)
+
+	var lifecycle *requestLifecycleTracker
+	var executedRequest func() (coreexecutor.Request, coreexecutor.Options)
+	var normalizedModel string
+	var currentOpts coreexecutor.Options
+
+	buildStreamAttempt := func(attemptCtx context.Context, attemptModel string, attemptOpts modelExecutionOptions, routeDecision modelRouteDecision) (*streamAttempt, *interfaces.ErrorMessage) {
+		providers, attemptModelResolved, errMsg := h.providersForExecution(attemptModel, attemptModel, allowImageModel, routeDecision, attemptOpts)
+		if errMsg != nil {
+			return nil, errMsg
+		}
+		providers = adjustExecutionProvidersForEntryProtocol(entryProtocol, providers)
+		reqMeta := requestExecutionMetadata(attemptCtx)
+		if attemptOpts.Path != "" {
+			reqMeta[coreexecutor.RequestPathMetadataKey] = attemptOpts.Path
+		}
+		addCallerScopeMetadata(reqMeta, attemptOpts.CallerScope)
+		reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
+		addAuthSelectionModelMetadata(reqMeta, attemptOpts.AuthSelectionModel)
+		addModelExecutionSourceMetadata(reqMeta, attemptOpts.InternalSource)
+		setReasoningEffortMetadata(reqMeta, entryProtocol, attemptModelResolved, rawJSON)
+		setServiceTierMetadata(reqMeta, rawJSON)
+		setGenerateMetadata(reqMeta, rawJSON)
+		payload := rawJSON
+		if len(payload) == 0 {
+			payload = nil
+		}
+		req := coreexecutor.Request{
+			Model:   attemptModelResolved,
+			Payload: payload,
+		}
+		originalRequest := rawJSON
+		if ctxOriginal := originalRequestFromContext(attemptCtx); len(ctxOriginal) > 0 {
+			originalRequest = ctxOriginal
+		}
+		afterAuthCapture := &requestAfterAuthCapture{}
+		if lifecycle == nil {
+			lifecycle = h.newRequestLifecycleTracker(attemptCtx, entryProtocol, attemptModelResolved, originalRequestedModel, true, reqMeta, attemptOpts.SkipInterceptorPluginID)
+		}
+		opts := coreexecutor.Options{
+			Stream:                       true,
+			Alt:                          alt,
+			OriginalRequest:              originalRequest,
+			SourceFormat:                 sdktranslator.FromString(entryProtocol),
+			ResponseFormat:               sdktranslator.FromString(responseProtocol),
+			Headers:                      modelExecutionHeaders(attemptCtx, attemptOpts.Headers),
+			Query:                        modelExecutionQuery(attemptCtx, attemptOpts.Query),
+			RequestBeforeAuthInterceptor: h.requestBeforeAuthInterceptor(lifecycle.requestID(), attemptOpts.SkipInterceptorPluginID),
+			RequestAfterAuthInterceptor:  h.requestAfterAuthInterceptor(afterAuthCapture, lifecycle.requestID(), attemptOpts.SkipInterceptorPluginID),
+			WebSocketResponseObserver:    h.webSocketResponseObserver(lifecycle.requestID(), attemptOpts.SkipInterceptorPluginID),
+			ProxyURL:                     attemptOpts.ProxyURL,
+		}
+		opts.Metadata = reqMeta
+		attemptCtx = enrichContextWithSessionHierarchy(attemptCtx, opts.Headers, req.Payload, opts.Metadata)
+		var interceptErr *interfaces.ErrorMessage
+		req, opts, interceptErr = h.applyRequestInterceptorsBeforeAuth(attemptCtx, entryProtocol, originalRequestedModel, lifecycle.requestID(), req, opts, attemptOpts.SkipInterceptorPluginID)
+		if interceptErr != nil {
+			return nil, interceptErr
+		}
+		attemptCtx = enrichContextWithSessionHierarchy(attemptCtx, opts.Headers, req.Payload, opts.Metadata)
+		return &streamAttempt{
+			providers:       providers,
+			normalizedModel: attemptModelResolved,
+			req:             req,
+			opts:            opts,
+			capture:         afterAuthCapture,
+			ctx:             attemptCtx,
+		}, nil
+	}
+
+	activateStreamAttempt := func(attempt *streamAttempt) {
+		normalizedModel = attempt.normalizedModel
+		currentOpts = attempt.opts
+		executedRequest = func() (coreexecutor.Request, coreexecutor.Options) {
+			return attempt.capture.apply(attempt.req, attempt.opts)
+		}
+	}
+
+	initialAttempt, errMsg := buildStreamAttempt(baseCtx, modelName, execOptions, initialRouteDecision)
+	if errMsg != nil {
+		if lifecycle != nil {
+			lifecycle.completeError(baseCtx, errMsg)
+		}
+		return streamErrorChannels(errMsg)
+	}
+	activateStreamAttempt(initialAttempt)
+	attempt := initialAttempt
+	attemptModel := modelName
+	attemptOpts := execOptions
+
 	// Resolve bootstrap retries and header initialization before returning so the
 	// returned header snapshot is never modified by the stream goroutine.
-	rawStreamHeaders := cloneHeader(streamResult.Headers)
-	baseStreamHeaders := cloneHeader(streamResult.Headers)
-	chunks := streamResult.Chunks
-	if chunks == nil {
-		closed := make(chan coreexecutor.StreamChunk)
-		close(closed)
-		chunks = closed
-	}
+	var rawStreamHeaders http.Header
+	var baseStreamHeaders http.Header
+	var chunks <-chan coreexecutor.StreamChunk
 	streamClosedBeforeRead := false
 	streamCanceledBeforeRead := false
 	streamHeaderInitialized := false
@@ -450,7 +471,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 				ResponseHeaders: cloneHeader(rawStreamHeaders),
 				Body:            payload,
 				ChunkIndex:      *chunkIndex,
-				Metadata:        opts.Metadata,
+				Metadata:        currentOpts.Metadata,
 			}
 			// Re-evaluate each chunk so mid-stream plugin reloads stay correct.
 			// Schema v5+ omits history here.
@@ -492,6 +513,27 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 	var bootstrapHistoryChunks [][]byte
 	var bootstrapStreamErr error
 	var bootstrapErr *interfaces.ErrorMessage
+	resetStreamAttempt := func(streamResult *coreexecutor.StreamResult) {
+		rawStreamHeaders = cloneHeader(streamResult.Headers)
+		baseStreamHeaders = cloneHeader(streamResult.Headers)
+		streamHeaderInitialized = false
+		streamClosedBeforeRead = false
+		streamCanceledBeforeRead = false
+		bootstrapStreamErr = nil
+		bootstrapErr = nil
+		bootstrapPayload = nil
+		bootstrapChunkIndex = 0
+		bootstrapHistoryChunks = nil
+		if responseSSEValidator != nil {
+			responseSSEValidator = &sseJSONValidationState{}
+		}
+		chunks = streamResult.Chunks
+		if chunks == nil {
+			closed := make(chan coreexecutor.StreamChunk)
+			close(closed)
+			chunks = closed
+		}
+	}
 	readInitialStreamChunks := func() {
 		for {
 			chunk, ok, canceled := nextStreamChunk(ctx, nil, nil, chunks)
@@ -542,47 +584,100 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 	if h.AuthManager.HomeEnabled() {
 		maxBootstrapRetries = 0
 	}
-	for bootstrapRetries := 0; !streamCanceledBeforeRead; {
-		readInitialStreamChunks()
-		if streamCanceledBeforeRead || bootstrapErr != nil || bootstrapStreamErr == nil {
-			break
+	bootstrapRetries := 0
+	var pendingResult *coreexecutor.StreamResult
+	// sawStreamResult reports whether any attempt obtained an upstream stream.
+	// Failures before that point preserve the legacy contract of returning nil
+	// data and header channels, while failures after it are delivered through
+	// the stream goroutine (matching bootstrap retry behavior).
+	sawStreamResult := false
+
+	for {
+		streamResult := pendingResult
+		pendingResult = nil
+		var errStream error
+		if streamResult == nil {
+			streamResult, errStream = h.AuthManager.ExecuteStream(attempt.ctx, attempt.providers, attempt.req, attempt.opts)
 		}
-		if bootstrapRetries >= maxBootstrapRetries || !bootstrapEligible(bootstrapStreamErr) {
-			bootstrapErr = executionErrorMessage(bootstrapStreamErr)
-			break
-		}
-		bootstrapRetries++
-		retryResult, retryErr := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
-		if retryErr != nil {
-			originalBootstrapErr := executionErrorMessage(bootstrapStreamErr)
-			if isAuthSelectionUnavailable(retryErr) && originalBootstrapErr.StatusCode >= http.StatusInternalServerError {
-				bootstrapErr = originalBootstrapErr
-			} else {
-				bootstrapErr = executionErrorMessage(enrichAuthSelectionError(retryErr, providers, normalizedModel))
+		if errStream == nil && streamResult == nil {
+			errStream = &coreauth.Error{
+				Code:       "nil_stream",
+				Message:    "auth manager returned nil stream",
+				HTTPStatus: http.StatusBadGateway,
 			}
+		}
+		if streamResult != nil {
+			sawStreamResult = true
+		}
+
+		chunkFailure := false
+		if errStream == nil {
+			// The after-auth interceptor runs inside ExecuteStream; refresh the
+			// request context with its headers before reading the stream.
+			if executedReq, executedOpts := attempt.capture.apply(attempt.req, attempt.opts); len(executedOpts.Headers) > 0 || len(executedReq.Payload) > 0 || len(executedOpts.Metadata) > 0 {
+				attempt.ctx = enrichContextWithSessionHierarchy(attempt.ctx, executedOpts.Headers, executedReq.Payload, executedOpts.Metadata)
+			}
+			ctx = attempt.ctx
+			resetStreamAttempt(streamResult)
+			readInitialStreamChunks()
+			if streamCanceledBeforeRead || bootstrapErr != nil || bootstrapStreamErr == nil {
+				break
+			}
+			chunkFailure = true
+			errStream = bootstrapStreamErr
+		}
+
+		// A bootstrap stream failure may retry on the same model before falling
+		// back to another model. Synchronous ExecuteStream errors do not.
+		if chunkFailure && bootstrapRetries < maxBootstrapRetries && bootstrapEligible(bootstrapStreamErr) {
+			bootstrapRetries++
+			retryResult, retryErr := h.AuthManager.ExecuteStream(attempt.ctx, attempt.providers, attempt.req, attempt.opts)
+			if retryErr != nil {
+				originalBootstrapErr := executionErrorMessage(bootstrapStreamErr)
+				if isAuthSelectionUnavailable(retryErr) && originalBootstrapErr.StatusCode >= http.StatusInternalServerError {
+					errStream = bootstrapStreamErr
+				} else {
+					errStream = retryErr
+				}
+			} else if retryResult == nil {
+				errStream = fmt.Errorf("auth manager returned nil stream")
+			} else {
+				pendingResult = retryResult
+				continue
+			}
+		}
+
+		errStream = enrichAuthSelectionError(errStream, attempt.providers, attempt.normalizedModel)
+		fbErr := fallbackEligibleError(errStream)
+		clientModel := clientRequestedModel(attemptModel, attemptOpts)
+		next, okFallback := h.nextFallbackModel(attempt.ctx, clientModel, fbErr, attemptOpts.FallbackDepth)
+		if !okFallback {
+			errMsg := executionErrorMessage(errStream)
+			if !sawStreamResult {
+				lifecycle.completeError(attempt.ctx, errMsg)
+				return streamErrorChannels(errMsg)
+			}
+			bootstrapErr = errMsg
 			break
 		}
-		if retryResult == nil {
-			bootstrapErr = executionErrorMessage(fmt.Errorf("auth manager returned nil stream"))
+		logModelFallback(clientModel, next, fbErr)
+
+		attemptModel = next
+		attemptOpts = h.fallbackExecutionOptions(attemptOpts, clientModel)
+		fallbackCtx := contextForModelFallback(baseCtx)
+		routeDecision := h.applyModelRouter(fallbackCtx, entryProtocol, attemptModel, rawJSON, true, attemptOpts)
+		if routeDecision.ExecutorPluginID != "" {
+			bootstrapErr = executionErrorMessage(errStream)
 			break
 		}
-		rawStreamHeaders = cloneHeader(retryResult.Headers)
-		baseStreamHeaders = cloneHeader(retryResult.Headers)
-		streamHeaderInitialized = false
-		streamClosedBeforeRead = false
-		bootstrapStreamErr = nil
-		bootstrapPayload = nil
-		bootstrapChunkIndex = 0
-		bootstrapHistoryChunks = nil
-		if responseSSEValidator != nil {
-			responseSSEValidator = &sseJSONValidationState{}
+		nextAttempt, buildErr := buildStreamAttempt(fallbackCtx, attemptModel, attemptOpts, routeDecision)
+		if buildErr != nil {
+			bootstrapErr = buildErr
+			break
 		}
-		chunks = retryResult.Chunks
-		if chunks == nil {
-			closed := make(chan coreexecutor.StreamChunk)
-			close(closed)
-			chunks = closed
-		}
+		attempt = nextAttempt
+		activateStreamAttempt(attempt)
+		bootstrapRetries = 0
 	}
 
 	upstreamHeaders := downstreamHeadersAfterInterceptors(baseStreamHeaders, rawStreamHeaders, passthroughHeadersEnabled)
@@ -591,6 +686,13 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 	}
 	dataChan := make(chan []byte)
 	errChan := make(chan *interfaces.ErrorMessage, 1)
+	// Only a response that was actually served by a fallback model is rewritten.
+	// Rewriting an ordinary response would leak fallback semantics into requests
+	// whose model was remapped by a router or resolved from "auto".
+	var rewriteModelName string
+	if attemptOpts.FallbackDepth > 0 {
+		rewriteModelName = fallbackResponseModel(h.CurrentConfig(), originalRequestedModel, normalizedModel)
+	}
 
 	go func() {
 		completionOutcome := pluginapi.RequestCompletionSucceeded
@@ -637,6 +739,20 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 			}
 		}
 
+		var streamRewriter *coreauth.StreamRewriter
+		if rewriteModelName != "" {
+			streamRewriter = coreauth.NewStreamRewriter(coreauth.StreamRewriteOptions{RewriteModel: rewriteModelName})
+		}
+		sendPayload := func(chunk []byte) bool {
+			if streamRewriter != nil {
+				chunk = streamRewriter.RewriteChunk(chunk)
+				if len(chunk) == 0 {
+					return true
+				}
+			}
+			return sendData(chunk)
+		}
+
 		if bootstrapErr != nil {
 			completionOutcome = pluginapi.RequestCompletionFailed
 			if bootstrapErr.DirectResponse {
@@ -651,7 +767,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 		chunkIndex := bootstrapChunkIndex
 		historyChunks := bootstrapHistoryChunks
 		if bootstrapPayload != nil {
-			if okSendData := sendData(bootstrapPayload); !okSendData {
+			if okSendData := sendPayload(bootstrapPayload); !okSendData {
 				completionOutcome = pluginapi.RequestCompletionCanceled
 				completionStatus = 0
 				if ctx != nil {
@@ -681,6 +797,16 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 						completionStatus = errMsg.StatusCode
 						completionErr = errMsg.Error
 						_ = sendErr(errMsg)
+						return
+					}
+				}
+				if streamRewriter != nil {
+					if tail := streamRewriter.Finish(); len(tail) > 0 && !sendData(tail) {
+						completionOutcome = pluginapi.RequestCompletionCanceled
+						completionStatus = 0
+						if ctx != nil {
+							completionErr = ctx.Err()
+						}
 					}
 				}
 				return
@@ -707,7 +833,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 			if !deliverable {
 				continue
 			}
-			if okSendData := sendData(payload); !okSendData {
+			if okSendData := sendPayload(payload); !okSendData {
 				completionOutcome = pluginapi.RequestCompletionCanceled
 				completionStatus = 0
 				if ctx != nil {

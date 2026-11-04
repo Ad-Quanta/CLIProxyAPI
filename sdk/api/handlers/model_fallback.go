@@ -4,9 +4,9 @@ import (
 	"errors"
 	"strings"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
-	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/fallback"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
 	log "github.com/sirupsen/logrus"
@@ -21,10 +21,14 @@ func clientRequestedModel(modelName string, opts modelExecutionOptions) string {
 }
 
 func (h *BaseAPIHandler) nextFallbackModel(ctx context.Context, requested string, err error, depth int) (string, bool) {
-	if h == nil || h.Cfg == nil || h.AuthManager == nil || (ctx != nil && ctx.Err() != nil) {
+	if h == nil || h.AuthManager == nil || (ctx != nil && ctx.Err() != nil) {
 		return "", false
 	}
-	fb := h.Cfg.ModelFallback
+	cfg := h.CurrentConfig()
+	if cfg == nil {
+		return "", false
+	}
+	fb := cfg.ModelFallback
 	if !fallback.ShouldFallback(err, fb) {
 		return "", false
 	}
@@ -74,6 +78,46 @@ func fallbackStatus(err error) int {
 	return 0
 }
 
+// fallbackStatusError adds a StatusCode to errors that expose one only through
+// the shared client-error extraction, such as context deadline failures.
+type fallbackStatusError struct {
+	err    error
+	status int
+}
+
+func (e *fallbackStatusError) Error() string {
+	if e == nil || e.err == nil {
+		return ""
+	}
+	return e.err.Error()
+}
+
+func (e *fallbackStatusError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.err
+}
+
+func (e *fallbackStatusError) StatusCode() int {
+	if e == nil {
+		return 0
+	}
+	return e.status
+}
+
+// fallbackEligibleError normalizes an execution error so fallback decisions can
+// use the same status extraction as the HTTP response path.
+func fallbackEligibleError(err error) error {
+	if err == nil || fallbackStatus(err) != 0 {
+		return err
+	}
+	if status := clienterror.HTTPStatusFromError(err); status > 0 {
+		return &fallbackStatusError{err: err, status: status}
+	}
+	return err
+}
+
 func fallbackResponseModel(cfg *config.SDKConfig, clientModel string, attemptModel string) string {
 	clientModel = strings.TrimSpace(clientModel)
 	attemptModel = strings.TrimSpace(attemptModel)
@@ -100,28 +144,4 @@ func rewriteFallbackResponse(cfg *config.SDKConfig, clientModel string, attemptM
 		return body
 	}
 	return rewritten
-}
-
-func rewriteModelStream(in <-chan coreexecutor.StreamChunk, model string) <-chan coreexecutor.StreamChunk {
-	out := make(chan coreexecutor.StreamChunk)
-	go func() {
-		defer close(out)
-		rewriter := coreauth.NewStreamRewriter(coreauth.StreamRewriteOptions{RewriteModel: model})
-		for chunk := range in {
-			if chunk.Err != nil || len(chunk.Payload) == 0 {
-				out <- chunk
-				continue
-			}
-			payload := rewriter.RewriteChunk(chunk.Payload)
-			if len(payload) == 0 {
-				continue
-			}
-			chunk.Payload = payload
-			out <- chunk
-		}
-		if tail := rewriter.Finish(); len(tail) > 0 {
-			out <- coreexecutor.StreamChunk{Payload: tail}
-		}
-	}()
-	return out
 }

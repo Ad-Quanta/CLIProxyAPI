@@ -48,80 +48,112 @@ func (h *BaseAPIHandler) executeWithAuthManagerFormats(ctx context.Context, entr
 	originalRequestedModel := modelName
 	// Speech-only models are reachable solely through the speech entry protocol.
 	execOptions.AllowSpeechModel = isModelExecutionSpeechProtocol(entryProtocol)
-	routeDecision := h.applyModelRouter(ctx, entryProtocol, modelName, rawJSON, false, execOptions)
+	initialRouteDecision := h.applyModelRouter(ctx, entryProtocol, modelName, rawJSON, false, execOptions)
 	responseProtocol := modelExecutionResponseProtocol(entryProtocol, exitProtocol)
-	if errMsg := validateNativeInteractionsExecution(entryProtocol, execOptions, routeDecision); errMsg != nil {
+	if errMsg := validateNativeInteractionsExecution(entryProtocol, execOptions, initialRouteDecision); errMsg != nil {
 		return nil, nil, errMsg
 	}
-	if routeDecision.ExecutorPluginID != "" {
-		return h.executeWithPluginExecutor(ctx, entryProtocol, responseProtocol, modelName, originalRequestedModel, rawJSON, alt, routeDecision.ExecutorPluginID, execOptions)
+	if initialRouteDecision.ExecutorPluginID != "" {
+		return h.executeWithPluginExecutor(ctx, entryProtocol, responseProtocol, modelName, originalRequestedModel, rawJSON, alt, initialRouteDecision.ExecutorPluginID, execOptions)
 	}
-	providers, normalizedModel, errMsg := h.providersForExecution(modelName, originalRequestedModel, allowImageModel, routeDecision, execOptions)
-	if errMsg != nil {
-		return nil, nil, errMsg
-	}
-	providers = adjustExecutionProvidersForEntryProtocol(entryProtocol, providers)
-	reqMeta := requestExecutionMetadata(ctx)
-	if execOptions.Path != "" {
-		reqMeta[coreexecutor.RequestPathMetadataKey] = execOptions.Path
-	}
-	addCallerScopeMetadata(reqMeta, execOptions.CallerScope)
-	reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
-	addAuthSelectionModelMetadata(reqMeta, execOptions.AuthSelectionModel)
-	addModelExecutionSourceMetadata(reqMeta, execOptions.InternalSource)
-	setReasoningEffortMetadata(reqMeta, entryProtocol, normalizedModel, rawJSON)
-	setServiceTierMetadata(reqMeta, rawJSON)
-	setGenerateMetadata(reqMeta, rawJSON)
-	payload := rawJSON
-	if len(payload) == 0 {
-		payload = nil
-	}
-	req := coreexecutor.Request{
-		Model:   normalizedModel,
-		Payload: payload,
-	}
-	originalRequest := rawJSON
-	if ctxOriginal := originalRequestFromContext(ctx); len(ctxOriginal) > 0 {
-		originalRequest = ctxOriginal
-	}
-	afterAuthCapture := &requestAfterAuthCapture{}
-	lifecycle := h.newRequestLifecycleTracker(ctx, entryProtocol, normalizedModel, originalRequestedModel, false, reqMeta, execOptions.SkipInterceptorPluginID)
-	opts := coreexecutor.Options{
-		Stream:                      false,
-		Alt:                         alt,
-		OriginalRequest:             originalRequest,
-		SourceFormat:                sdktranslator.FromString(entryProtocol),
-		ResponseFormat:              sdktranslator.FromString(responseProtocol),
-		Headers:                     modelExecutionHeaders(ctx, execOptions.Headers),
-		Query:                       modelExecutionQuery(ctx, execOptions.Query),
-		RequestAfterAuthInterceptor: h.requestAfterAuthInterceptor(afterAuthCapture, lifecycle.requestID(), execOptions.SkipInterceptorPluginID),
-		WebSocketResponseObserver:   h.webSocketResponseObserver(lifecycle.requestID(), execOptions.SkipInterceptorPluginID),
-		ProxyURL:                    execOptions.ProxyURL,
-	}
-	opts.Metadata = reqMeta
-	ctx = enrichContextWithSessionHierarchy(ctx, opts.Headers, req.Payload, opts.Metadata)
-	var interceptErr *interfaces.ErrorMessage
-	req, opts, interceptErr = h.applyRequestInterceptorsBeforeAuth(ctx, entryProtocol, originalRequestedModel, lifecycle.requestID(), req, opts, execOptions.SkipInterceptorPluginID)
-	if interceptErr != nil {
-		lifecycle.completeError(ctx, interceptErr)
-		return nil, nil, interceptErr
-	}
-	ctx = enrichContextWithSessionHierarchy(ctx, opts.Headers, req.Payload, opts.Metadata)
-	resp, err := h.AuthManager.Execute(ctx, providers, req, opts)
-	if err != nil {
-		err = enrichAuthSelectionError(err, providers, normalizedModel)
-		errMsg := executionErrorMessage(err)
-		lifecycle.completeError(ctx, errMsg)
-		return nil, nil, errMsg
-	}
-	executedReq, executedOpts := afterAuthCapture.apply(req, opts)
-	ctx = enrichContextWithSessionHierarchy(ctx, executedOpts.Headers, executedReq.Payload, executedOpts.Metadata)
-	rawResponseHeaders := cloneHeader(resp.Headers)
+
 	passthroughHeaders := executionPassthroughHeaders(h.CurrentConfig(), execOptions.InternalSource)
-	responseHeaders := downstreamHeadersFromExecutor(rawResponseHeaders, passthroughHeaders)
-	body, responseHeaders := h.applyResponseInterceptors(ctx, lifecycle.requestID(), responseProtocol, normalizedModel, originalRequestedModel, executedOpts, rawResponseHeaders, responseHeaders, executedOpts.OriginalRequest, executedReq.Payload, resp.Payload, http.StatusOK, execOptions.SkipInterceptorPluginID, passthroughHeaders)
-	lifecycle.complete(pluginapi.RequestCompletionSucceeded, http.StatusOK, nil)
-	return body, responseHeaders, nil
+	attemptModel := modelName
+	attemptOpts := execOptions
+	attemptCtx := ctx
+	routeDecision := initialRouteDecision
+	var lifecycle *requestLifecycleTracker
+
+	for {
+		providers, normalizedModel, errMsg := h.providersForExecution(attemptModel, attemptModel, allowImageModel, routeDecision, attemptOpts)
+		if errMsg != nil {
+			return nil, nil, errMsg
+		}
+		providers = adjustExecutionProvidersForEntryProtocol(entryProtocol, providers)
+		reqMeta := requestExecutionMetadata(attemptCtx)
+		if attemptOpts.Path != "" {
+			reqMeta[coreexecutor.RequestPathMetadataKey] = attemptOpts.Path
+		}
+		addCallerScopeMetadata(reqMeta, attemptOpts.CallerScope)
+		reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
+		addAuthSelectionModelMetadata(reqMeta, attemptOpts.AuthSelectionModel)
+		addModelExecutionSourceMetadata(reqMeta, attemptOpts.InternalSource)
+		setReasoningEffortMetadata(reqMeta, entryProtocol, normalizedModel, rawJSON)
+		setServiceTierMetadata(reqMeta, rawJSON)
+		setGenerateMetadata(reqMeta, rawJSON)
+		payload := rawJSON
+		if len(payload) == 0 {
+			payload = nil
+		}
+		req := coreexecutor.Request{
+			Model:   normalizedModel,
+			Payload: payload,
+		}
+		originalRequest := rawJSON
+		if ctxOriginal := originalRequestFromContext(attemptCtx); len(ctxOriginal) > 0 {
+			originalRequest = ctxOriginal
+		}
+		afterAuthCapture := &requestAfterAuthCapture{}
+		if lifecycle == nil {
+			lifecycle = h.newRequestLifecycleTracker(attemptCtx, entryProtocol, normalizedModel, originalRequestedModel, false, reqMeta, attemptOpts.SkipInterceptorPluginID)
+		}
+		opts := coreexecutor.Options{
+			Stream:                      false,
+			Alt:                         alt,
+			OriginalRequest:             originalRequest,
+			SourceFormat:                sdktranslator.FromString(entryProtocol),
+			ResponseFormat:              sdktranslator.FromString(responseProtocol),
+			Headers:                     modelExecutionHeaders(attemptCtx, attemptOpts.Headers),
+			Query:                       modelExecutionQuery(attemptCtx, attemptOpts.Query),
+			RequestAfterAuthInterceptor: h.requestAfterAuthInterceptor(afterAuthCapture, lifecycle.requestID(), attemptOpts.SkipInterceptorPluginID),
+			WebSocketResponseObserver:   h.webSocketResponseObserver(lifecycle.requestID(), attemptOpts.SkipInterceptorPluginID),
+			ProxyURL:                    attemptOpts.ProxyURL,
+		}
+		opts.Metadata = reqMeta
+		attemptCtx = enrichContextWithSessionHierarchy(attemptCtx, opts.Headers, req.Payload, opts.Metadata)
+		var interceptErr *interfaces.ErrorMessage
+		req, opts, interceptErr = h.applyRequestInterceptorsBeforeAuth(attemptCtx, entryProtocol, originalRequestedModel, lifecycle.requestID(), req, opts, attemptOpts.SkipInterceptorPluginID)
+		if interceptErr != nil {
+			lifecycle.completeError(attemptCtx, interceptErr)
+			return nil, nil, interceptErr
+		}
+		attemptCtx = enrichContextWithSessionHierarchy(attemptCtx, opts.Headers, req.Payload, opts.Metadata)
+		resp, err := h.AuthManager.Execute(attemptCtx, providers, req, opts)
+		if err != nil {
+			err = enrichAuthSelectionError(err, providers, normalizedModel)
+			fbErr := fallbackEligibleError(err)
+			clientModel := clientRequestedModel(attemptModel, attemptOpts)
+			if next, ok := h.nextFallbackModel(attemptCtx, clientModel, fbErr, attemptOpts.FallbackDepth); ok {
+				logModelFallback(clientModel, next, fbErr)
+				attemptModel = next
+				attemptOpts = h.fallbackExecutionOptions(attemptOpts, clientModel)
+				attemptCtx = contextForModelFallback(ctx)
+				routeDecision = h.applyModelRouter(attemptCtx, entryProtocol, attemptModel, rawJSON, false, attemptOpts)
+				if routeDecision.ExecutorPluginID != "" {
+					errMsg := executionErrorMessage(err)
+					lifecycle.completeError(attemptCtx, errMsg)
+					return nil, nil, errMsg
+				}
+				continue
+			}
+			errMsg := executionErrorMessage(err)
+			lifecycle.completeError(attemptCtx, errMsg)
+			return nil, nil, errMsg
+		}
+		executedReq, executedOpts := afterAuthCapture.apply(req, opts)
+		attemptCtx = enrichContextWithSessionHierarchy(attemptCtx, executedOpts.Headers, executedReq.Payload, executedOpts.Metadata)
+		rawResponseHeaders := cloneHeader(resp.Headers)
+		responseHeaders := downstreamHeadersFromExecutor(rawResponseHeaders, passthroughHeaders)
+		body, responseHeaders := h.applyResponseInterceptors(attemptCtx, lifecycle.requestID(), responseProtocol, normalizedModel, originalRequestedModel, executedOpts, rawResponseHeaders, responseHeaders, executedOpts.OriginalRequest, executedReq.Payload, resp.Payload, http.StatusOK, attemptOpts.SkipInterceptorPluginID, passthroughHeaders)
+		// Only a response that was actually served by a fallback model is rewritten.
+		// Rewriting an ordinary response would leak fallback semantics into requests
+		// whose model was remapped by a router or resolved from "auto".
+		if attemptOpts.FallbackDepth > 0 {
+			body = rewriteFallbackResponse(h.CurrentConfig(), originalRequestedModel, normalizedModel, body)
+		}
+		lifecycle.complete(pluginapi.RequestCompletionSucceeded, http.StatusOK, nil)
+		return body, responseHeaders, nil
+	}
 }
 
 // ExecuteCountWithAuthManager executes a non-streaming request via the core auth manager.
