@@ -64,3 +64,10 @@ For a focused change, run the affected package tests first, then run the full su
 - [Home deployment notes](home/README.md)
 - [Operations notes](OPS.md)
 
+
+团队日常阅读优先使用中文入口：
+
+- [贡献指南（中文）](CONTRIBUTING_CN.md)
+- [开发说明（中文）](DEVELOPMENT_CN.md)
+- [重试和兜底（中文）](docs/retry-and-fallback_CN.md)
+- [CLIProxyAPIHome 协作（中文）](docs/home-integration_CN.md)

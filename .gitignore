@@ -82,3 +82,5 @@ __pycache__/
 # Internal ops notes (host IPs / topology)
 /OPS.md
 /HANDOFF_*.md
+!docs/retry-and-fallback_CN.md
+!docs/home-integration_CN.md
