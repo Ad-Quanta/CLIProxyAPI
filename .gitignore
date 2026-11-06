@@ -31,6 +31,8 @@ auths/*
 # Documentation
 docs/*
 !docs/management-api-v8.md
+!docs/retry-and-fallback.md
+!docs/home-integration.md
 AGENTS.md
 CLAUDE.md
 GEMINI.md
